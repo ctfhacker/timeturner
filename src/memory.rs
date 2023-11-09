@@ -1,8 +1,9 @@
-use crate::Timer;
+use crate::{MemoryAccess, Timer};
+use std::collections::BTreeMap;
 
 /// The size of each memory page that the debugger knows about. Must
 /// be a power of two.
-const PAGE_SIZE: u64 = 4096;
+const PAGE_SIZE: u64 = 4096 * 4096;
 
 /// The mask used to get the beginning of a page using a bitwise and.
 ///
@@ -13,16 +14,18 @@ const PAGE_SIZE: u64 = 4096;
 const OFFSET_MASK: u64 = PAGE_SIZE - 1;
 const PAGE_MASK: u64 = !OFFSET_MASK;
 
-/// Constant check if the given number is a power of two
-const fn is_power_of_two(n: u64) -> bool {
-    n != 0 && (n & (n - 1)) == 0
+// Ensure page size is power of two
+const _: () = assert!(PAGE_SIZE.is_power_of_two());
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub enum ByteState {
+    #[default]
+    Unknown,
+    Known,
 }
 
-// Ensure page size is power of two
-const _: () = assert!(is_power_of_two(PAGE_SIZE));
-
 /// A memory backing
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct Memory {
     /// Lookup table from masked address to the index into the memory list.
     ///
@@ -31,20 +34,50 @@ pub struct Memory {
     /// 0xdead_0000 -> 1 => self.memory[1][8] = 0xdead_0008
     pub lookup_table_addresses: Vec<u64>,
 
+    /// The state of each byte in memory
+    pub byte_state: Vec<Vec<ByteState>>,
+
     /// The memory tables in the debugger
-    pub memory: Vec<Vec<Option<u8>>>,
+    pub memory: Vec<Vec<u8>>,
+
+    /// The sequence of bytes written to each address
+    pub byte_history: BTreeMap<u64, (Vec<usize>, Vec<u8>)>,
+    // /// The memory reads found in the trace
+    // ///
+    // /// Key: Address Val: The index in the trace where this read occurred
+    // pub memory_reads: BTreeMap<u64, Vec<usize>>,
+
+    // /// The memory writes of each address found in the trace
+    // ///
+    // /// Key: Address Val: The index in the trace where this read occurred
+    // pub memory_writes: BTreeMap<u64, Vec<usize>>,
 }
 
 impl Memory {
     /// Reset all of the memory bytes, but keep the lookup table structure allocated
     pub fn soft_reset(&mut self) {
-        self.memory
+        timeloop::scoped_timer!(Timer::Memory_SoftReset);
+
+        self.byte_state
             .iter_mut()
-            .for_each(|page| *page = vec![None; PAGE_SIZE as usize])
+            .for_each(|page| *page = vec![ByteState::Unknown; PAGE_SIZE as usize])
+    }
+
+    /// Set the byte at the given address to the given state
+    pub fn set_byte_state(&mut self, address: u64, state: ByteState) {
+        let page_index = self.get_page_index(address);
+        let offset = (address & OFFSET_MASK) as usize;
+        self.byte_state[page_index][offset] = state;
     }
 
     /// Set the current memory address with the given bytes
-    pub fn set_bytes(&mut self, address: u64, bytes: &[u8]) {
+    pub fn set_bytes(
+        &mut self,
+        instr_index: usize,
+        address: u64,
+        bytes: &[u8],
+        access: MemoryAccess,
+    ) {
         timeloop::scoped_timer!(Timer::Memory_SetBytes);
 
         if self.is_straddling_page(address, bytes.len() as u64) {
@@ -54,14 +87,41 @@ impl Memory {
         // Get the page index for this address
         let page_index = self.get_page_index(address);
 
-        // Get the current page of memory containing this address
-        let curr_mem_page = &mut self.memory[page_index];
-
         // Set the requested bytes to the memory
         let offset = (address & OFFSET_MASK) as usize;
         for (index, byte) in bytes.iter().enumerate() {
-            curr_mem_page[offset + index] = Some(*byte);
+            self.memory[page_index][offset + index] = *byte;
+            self.byte_state[page_index][offset + index] = ByteState::Known;
+
+            // Setup the byte_history
+            //
+            // If this address hasn't been seen yet, and it was just read, then that byte starts.
+            let curr_addr = address + index as u64;
+            if matches!(access, MemoryAccess::Read) && !self.byte_history.contains_key(&curr_addr) {
+                self.byte_history
+                    .insert(curr_addr, (vec![(0)], vec![*byte]));
+            } else {
+                let (indexes, bytes) = self.byte_history.entry(curr_addr).or_default();
+
+                if *indexes.last().unwrap_or(&0) < instr_index {
+                    indexes.push(instr_index);
+                    bytes.push(*byte);
+                }
+            }
         }
+    }
+
+    /// Set the given byte to the given address
+    pub fn set_byte(&mut self, address: u64, byte: u8) {
+        timeloop::scoped_timer!(Timer::Memory_SetByte);
+
+        // Get the page index for this address
+        let page_index = self.get_page_index(address);
+
+        // Set the single byte specifically
+        let offset = (address & OFFSET_MASK) as usize;
+        self.memory[page_index][offset] = byte;
+        self.byte_state[page_index][offset] = ByteState::Known;
     }
 
     /// Returns true if address..address + n straddles the given PAGE_SIZE
@@ -91,7 +151,7 @@ impl Memory {
         index
     }
 
-    pub fn read(&mut self, address: u64, n: usize) -> &[Option<u8>] {
+    pub fn read(&mut self, address: u64, n: usize) -> Vec<Option<u8>> {
         timeloop::scoped_timer!(Timer::Memory_Read);
 
         if self.is_straddling_page(address, n as u64) {
@@ -100,15 +160,28 @@ impl Memory {
 
         let page_index = self.get_page_index(address);
         let offset = (address & OFFSET_MASK) as usize;
-        &self.memory[page_index][offset..offset + n]
+
+        let mut result = Vec::with_capacity(n);
+        for byte_index in offset..offset + n {
+            if matches!(self.byte_state[page_index][byte_index], ByteState::Unknown) {
+                result.push(None);
+            } else {
+                result.push(Some(self.memory[page_index][byte_index]));
+            }
+        }
+
+        result
     }
 
     /// Allocate a page of memory and return the index into the lookup table for this memory
     pub fn allocate_page(&mut self) -> usize {
         timeloop::scoped_timer!(Timer::Memory_AllocatePage);
-        let new_memory = vec![None; PAGE_SIZE as usize];
+        let new_memory = vec![0; PAGE_SIZE as usize];
+        let new_memory_states = vec![ByteState::Unknown; PAGE_SIZE as usize];
+
         let new_index = self.memory.len();
         self.memory.push(new_memory);
+        self.byte_state.push(new_memory_states);
         new_index
     }
 
@@ -130,5 +203,23 @@ impl Memory {
         }
 
         println!();
+    }
+
+    pub fn diff(&self, other: &Memory) {
+        for (page_index, page) in self.byte_state.iter().enumerate() {
+            for (byte_index, access) in page.iter().enumerate() {
+                if matches!(access, ByteState::Unknown) {
+                    continue;
+                }
+
+                // println!("Page: {page_index:#x} Byte index: {byte_index:#x}");
+                // dbg!(self.memory[page_index][byte_index]);
+                // dbg!(other.memory[page_index][byte_index]);
+
+                assert!(
+                    self.memory[page_index][byte_index] == other.memory[page_index][byte_index]
+                );
+            }
+        }
     }
 }

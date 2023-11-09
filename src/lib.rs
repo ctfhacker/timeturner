@@ -1,16 +1,16 @@
 #![feature(thread_id_value)]
 
+// mod auto_restore_cell;
+// use auto_restore_cell::AutoRestoreCell;
 mod memory;
 mod utils;
 
 use memory::Memory;
 use utils::parse_hex_string;
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::mem::{size_of, size_of_val};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The maximum number of memory entries allowed per trace entry line
 /// before heap allocating storage for the memory diff
@@ -38,11 +38,16 @@ timeloop::impl_enum!(
         TraceAddMemoryDiff,
         ReadInput,
         UpdateMemory,
+        UpdateMemoryForward,
+        UpdateMemoryBackward,
+        UpdateMemoryBackwardCollapseWrites,
         ContextAt,
         PrintContext,
         Hexdump,
         StepForward,
         StepBackward,
+        Reset,
+        GotoIndex,
 
         Memory_AllocatePage,
         Memory_SetMemory,
@@ -51,6 +56,9 @@ timeloop::impl_enum!(
         Memory_Hexdump,
         Memory_Read,
         Memory_SetBytes,
+        Memory_SoftReset,
+        Memory_SetByte,
+        Memory_CheckNewInstrIndex,
     }
 );
 
@@ -149,7 +157,6 @@ pub enum MemoryAccess {
     None,
     Read,
     Write,
-    ReadWrite,
 }
 
 /// The address and bytes that were read or wrriten to that address
@@ -193,10 +200,10 @@ impl<const MEMORY_ENTRIES: usize> std::fmt::Debug for MemoryData<MEMORY_ENTRIES>
                         _ => unreachable!(),
                     };
 
-                    write!(f, "{access:?} {address:#x} {operation} ");
+                    write!(f, "{access:?} {address:#x} {operation} ")?;
 
                     for byte in &bytes[..num_bytes] {
-                        write!(f, "{:02x} ", byte);
+                        write!(f, "{:02x} ", byte)?;
                     }
                 }
             }
@@ -212,11 +219,13 @@ impl<const MEMORY_ENTRIES: usize> std::fmt::Debug for MemoryData<MEMORY_ENTRIES>
                         _ => unreachable!(),
                     };
 
-                    write!(f, "{access:?} {address:#x} {operation} ");
+                    write!(f, "{access:?} {address:#x} {operation} ")?;
 
                     for byte in curr_bytes {
-                        write!(f, "{byte:02x}");
+                        write!(f, "{byte:02x}")?;
                     }
+
+                    write!(f, " ")?;
                 }
             }
         }
@@ -310,7 +319,7 @@ impl<const MEMORY_ENTRIES: usize> MemoryData<MEMORY_ENTRIES> {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Debugger {
     /// The current index in the trace
     pub index: usize,
@@ -322,7 +331,8 @@ pub struct Debugger {
     pub registers: [Vec<u64>; Register::count()],
 
     /// The memory backing for the debugger
-    pub memory: Option<Memory>,
+    // pub memory: AutoRestoreCell<Memory>,
+    pub memory: Memory,
 
     /// The memory diff for this step
     pub memory_diffs: Vec<MemoryData<MEMORY_ENTRIES>>,
@@ -422,16 +432,18 @@ impl Debugger {
             dbg.add_diff(diff);
         }
 
-        dbg.memory = Some(Memory::default());
-        dbg.update_memory();
+        // dbg.memory = AutoRestoreCell::new(Memory::default());
+        dbg.memory = Memory::default();
+
+        dbg.update_memory_to(0);
 
         Ok(dbg)
     }
 
     pub fn size(&self) -> usize {
         let Debugger {
-            index,
-            entries,
+            index: _,
+            entries: _,
             registers,
             memory,
             memory_diffs,
@@ -464,7 +476,6 @@ impl Debugger {
         timeloop::scoped_timer!(Timer::TraceAddRegisterDiff);
 
         let mut seen_registers = [false; Register::count()];
-        let mut diff_registers = 0;
 
         // Add the register states to the trace
         for (index, reg) in diff.register.iter().enumerate() {
@@ -511,6 +522,42 @@ impl Debugger {
     ) {
         timeloop::scoped_timer!(Timer::TraceAddMemoryDiff);
         self.memory_diffs.push(diff.memory_data.clone());
+
+        /*
+        for (
+            index,
+            MemoryDataItem {
+                address,
+                bytes,
+                access,
+            },
+        ) in self.memory_diffs[self.index].iter().enumerate()
+        {
+            /*
+            match access {
+                MemoryAccess::Read => {
+                    self.memory
+                        .memory_reads
+                        .entry(address)
+                        .or_default()
+                        .push(index);
+                }
+                MemoryAccess::Write => {
+                    self.memory
+                        .memory_writes
+                        .entry(address)
+                        .or_default()
+                        .push(index);
+                }
+                MemoryAccess::None => {
+                    // Nothing to add for none memory access
+                }
+            }
+            */
+
+            self.memory.set_bytes(address, bytes);
+        }
+        */
     }
 
     pub fn context_at(&mut self, index: usize) {
@@ -537,8 +584,8 @@ impl Debugger {
     pub fn step_forward(&mut self) {
         timeloop::scoped_timer!(Timer::StepForward);
 
-        self.index = (self.index + 1).min(self.registers[0].len());
-        self.update_memory();
+        let next_index = (self.index + 1).min(self.entries);
+        self.goto_index(next_index);
     }
 
     /// Step backward one step
@@ -546,18 +593,15 @@ impl Debugger {
         timeloop::scoped_timer!(Timer::StepBackward);
 
         let prev_index = self.index.saturating_sub(1);
-        self.reset();
-        for _ in 0..prev_index {
-            self.index = (self.index + 1).min(self.registers[0].len());
-            self.update_memory();
-        }
+        self.goto_index(prev_index);
     }
 
+    /// Reset the debugger's state
     pub fn reset(&mut self) {
+        timeloop::scoped_timer!(Timer::Reset);
+
         self.index = 0;
-        let mut memory = self.memory.take().expect("Invalid memory state");
-        memory.soft_reset();
-        self.memory = Some(memory);
+        self.memory.soft_reset();
     }
 
     pub fn exec_command(&mut self, command: &str) -> Result<(), ()> {
@@ -579,58 +623,140 @@ impl Debugger {
         self.context_at(self.index);
     }
 
-    /// Drop into an interactive terminal for this debugger
-    pub fn interactive(&mut self) -> Result<(), ()> {
-        loop {
-            self.context_at(self.index);
-            print!("(timeturner:{}) ", self.index);
-            std::io::stdout().flush().unwrap();
-
-            let mut command = String::new();
-
-            std::io::stdin()
-                .read_line(&mut command)
-                .expect("Failed to get command");
-
-            self.exec_command(command.trim())?;
-        }
-    }
-
     /// Print a hexdump at the given address of n bytes
     pub fn hexdump(&mut self, address: u64, n: usize) {
         timeloop::scoped_timer!(Timer::Hexdump);
+        self.memory.hexdump(address, n);
+    }
 
-        let mut memory = self.memory.take().expect("Invalid memory state");
-        memory.hexdump(address, n);
-        self.memory = Some(memory);
+    pub fn goto_index(&mut self, new_index: usize) {
+        timeloop::scoped_timer!(Timer::GotoIndex);
+
+        self.update_memory_to(new_index);
+        self.index = new_index;
     }
 
     /// Update the memory from the current index
-    pub fn update_memory(&mut self) {
+    fn update_memory_to(&mut self, target_index: usize) {
         timeloop::scoped_timer!(Timer::UpdateMemory);
 
-        let mut memory = self.memory.take().expect("Invalid memory state");
+        if target_index >= self.index {
+            timeloop::scoped_timer!(Timer::UpdateMemoryForward);
+            // Update forward (easy path)
+            for (i, diffs) in self.memory_diffs[self.index..target_index + 1]
+                .iter()
+                .enumerate()
+            {
+                for MemoryDataItem {
+                    address,
+                    bytes,
+                    access,
+                } in diffs.iter()
+                {
+                    self.memory
+                        .set_bytes(self.index + i, address, bytes, access);
+                }
+            }
+        } else {
+            timeloop::scoped_timer!(Timer::UpdateMemoryBackward);
 
-        for MemoryDataItem {
-            address,
-            bytes,
-            access,
-        } in self.memory_diffs[self.index].iter()
-        {
-            memory.set_bytes(address, bytes);
+            // Update backward (hard-er path)
+            let mut writes = BTreeMap::new();
+
+            {
+                timeloop::scoped_timer!(Timer::UpdateMemoryBackwardCollapseWrites);
+
+                // Collapse all of the writes to the memory addresses within the backward range
+                // to only one write per byte
+                for (i, diffs) in self.memory_diffs[target_index..self.index + 1]
+                    .iter()
+                    .enumerate()
+                    .rev()
+                {
+                    for MemoryDataItem {
+                        address,
+                        bytes,
+                        access,
+                    } in diffs.iter()
+                    {
+                        if matches!(access, MemoryAccess::Write)
+                            || matches!(access, MemoryAccess::Read)
+                        {
+                            for offset in 0..bytes.len() as u64 {
+                                writes.insert(address + offset, i + target_index);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Printing the current byte history
+            for (addr, indexes) in self.memory.byte_history.iter() {
+                // println!("{addr:#x} {indexes:?}");
+            }
+
+            for (addr, last_write) in writes.iter() {
+                let Some((addresses, bytes)) = self.memory.byte_history.get_mut(addr) else {
+                    panic!("Invalid byte history state");
+                };
+
+                let result = addresses.binary_search(last_write);
+
+                /*
+                println!(
+                    "XXX {}..{} {addr:#x} {last_write} -> {result:?}",
+                    self.index, target_index
+                );
+                */
+
+                match result {
+                    Err(0) => {
+                        // If there was no prior byte in this address's history.
+                        self.memory
+                            .set_byte_state(*addr, memory::ByteState::Unknown);
+                        self.memory.set_byte(*addr, 0);
+                    }
+                    Err(index) => {
+                        // Get the last known byte before this address was written
+                        let last_byte = bytes[index - 1];
+                        // println!("  --> {last_write} ({last_byte:#x})");
+
+                        self.memory.set_byte_state(*addr, memory::ByteState::Known);
+                        self.memory.set_byte(*addr, last_byte);
+                    }
+                    Ok(mut index) => {
+                        // println!("Found instr: {} Target: {}", addresses[index], target_index);
+                        while index > 0 && addresses[index] > target_index {
+                            // println!("  --> SUB INDEX");
+                            index = index.saturating_sub(1);
+                            /*
+                            println!(
+                                "  --> Found instr: {} Target: {} Byte: {:#x}",
+                                addresses[index], target_index, bytes[index]
+                            );
+                            */
+                        }
+
+                        // Value was found, use this index as the last byte in the history
+                        let last_byte = bytes[index];
+                        // println!("  --> {last_write} ({last_byte:#x})");
+
+                        self.memory.set_byte_state(*addr, memory::ByteState::Known);
+                        self.memory.set_byte(*addr, last_byte);
+                    }
+                }
+            }
         }
-
-        self.memory = Some(memory);
     }
 }
 
-enum CommandResult {
+pub enum CommandResult {
     Continue,
     Quit,
 }
 
 #[derive(Clone)]
-struct TraceDiff<const REGISTER_ENTRIES: usize, const MEMORY_ENTRIES: usize> {
+pub struct TraceDiff<const REGISTER_ENTRIES: usize, const MEMORY_ENTRIES: usize> {
     pub register: [Register; REGISTER_ENTRIES],
     pub register_data: [u64; REGISTER_ENTRIES],
     pub memory_data: MemoryData<MEMORY_ENTRIES>,
@@ -695,9 +821,10 @@ impl<const REGISTER_ENTRIES: usize, const MEMORY_ENTRIES: usize>
             return Err(Error::AddMemory);
         };
 
-        // Allocate and populate the memory values
+        // Allocate and populate the memory values from the static allocations
         let mut new_data = Vec::new();
         let mut new_addresses = Vec::new();
+        let mut new_accesses = mem_accesses.to_vec();
         for (index, data) in mem_values.iter().enumerate() {
             // Ensure that the access has actually been set
             if matches!(mem_accesses[index], MemoryAccess::None) {
@@ -711,7 +838,9 @@ impl<const REGISTER_ENTRIES: usize, const MEMORY_ENTRIES: usize>
             new_data.push(bytes[..data_size].to_vec());
         }
 
-        let mut new_accesses = mem_accesses.to_vec();
+        // Now add the requested memory
+        new_addresses.push(address);
+        new_data.push(bytes[..num_bytes as usize].to_vec());
         new_accesses.push(access);
 
         self.memory_data = MemoryData::Dynamic((new_addresses, new_data, new_accesses));
@@ -741,7 +870,7 @@ impl<const REGISTER_ENTRIES: usize, const MEMORY_ENTRIES: usize> std::fmt::Debug
                 break;
             }
 
-            write!(f, "{reg:?}:{val:#x} ");
+            write!(f, "{reg:?}:{val:#x} ")?;
         }
 
         write!(f, "{:?}", self.memory_data)
