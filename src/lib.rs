@@ -69,11 +69,6 @@ timeloop::impl_enum!(
         Memory_Hexdump,
         Memory_Read,
         Memory_SetBytes,
-        Memory_SetBytes1,
-        Memory_SetBytes2,
-        Memory_SetBytes3,
-        Memory_SetBytes4,
-        Memory_SetBytes5,
         Memory_SetBytesRead,
         Memory_SetBytesWrite,
         Memory_SetBytesWrite1,
@@ -82,6 +77,16 @@ timeloop::impl_enum!(
         Memory_SoftReset,
         Memory_SetByte,
         Memory_CheckNewInstrIndex,
+
+        Memory_SetBytes1,
+        Memory_SetBytes2,
+        Memory_SetBytes3,
+        Memory_SetBytes4,
+        Memory_SetBytes5,
+        Memory_SetBytes6,
+        Memory_SetBytes7,
+        Memory_SetBytes8,
+        Memory_SetBytes9,
     }
 );
 
@@ -318,6 +323,12 @@ pub struct Debugger {
 
     /// The sequence of bytes written to each address
     pub byte_history: BTreeMap<u64, (Vec<InstrIndex>, Vec<u8>)>,
+
+    /// Pre-allocated vecs ready for use for instr index
+    pub ready_vec_instr_index: Vec<Vec<InstrIndex>>,
+
+    /// Pre-allocated vecs ready for use for bytes
+    pub ready_vec_bytes: Vec<Vec<u8>>,
 }
 
 impl Debugger {
@@ -338,8 +349,9 @@ impl Debugger {
             log::info!("Loading from ttdbg");
 
             // If restoring the debugger ttdbg, then return the result
-            if let Ok(res) = Debugger::restore(&input) {
+            if let Ok(mut res) = Debugger::restore(&input) {
                 res.size();
+                res.preallocate();
                 return Ok(res);
             }
 
@@ -506,7 +518,19 @@ impl Debugger {
         // Write this debugger to disk
         dbg.save(&outfile);
 
+        dbg.preallocate();
+
         Ok(dbg)
+    }
+
+    /// Pre-allocate a bunch of vectors for use in the debugger
+    pub fn preallocate(&mut self) {
+        let start = std::time::Instant::now();
+        for _ in 0..10000 {
+            self.ready_vec_bytes.push(Vec::with_capacity(1024));
+            self.ready_vec_instr_index.push(Vec::with_capacity(1024));
+        }
+        println!("Pre alloc took {:?}", start.elapsed());
     }
 
     /// Save this debugger to disk
@@ -545,6 +569,8 @@ impl Debugger {
             memory_reads,
             memory_writes,
             byte_history,
+            ready_vec_instr_index,
+            ready_vec_bytes,
         } = self;
 
         let mut total = 0;
@@ -882,6 +908,8 @@ impl Debugger {
                         &mut self.memory_reads,
                         &mut self.memory_writes,
                         &mut self.byte_history,
+                        &mut self.ready_vec_bytes,
+                        &mut self.ready_vec_instr_index,
                     );
                 }
             }

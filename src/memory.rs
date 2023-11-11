@@ -69,6 +69,8 @@ impl Memory {
         memory_reads: &mut BTreeMap<u64, Vec<InstrIndex>>,
         memory_writes: &mut BTreeMap<u64, Vec<InstrIndex>>,
         byte_history: &mut BTreeMap<u64, (Vec<InstrIndex>, Vec<u8>)>,
+        ready_vec_bytes: &mut Vec<Vec<u8>>,
+        ready_vec_instr_index: &mut Vec<Vec<InstrIndex>>,
     ) {
         if self.is_straddling_page(address, bytes.len() as u64) {
             panic!("Address straddles memory: {address:#x} {bytes:x?}");
@@ -81,20 +83,14 @@ impl Memory {
         let offset = (address & OFFSET_MASK) as usize;
 
         // Copy the known bytes into memory and set them as known
-        self.memory[page_index][offset..offset + bytes.len()].copy_from_slice(bytes);
-        self.byte_state[page_index][offset..offset + bytes.len()]
-            .copy_from_slice(&vec![ByteState::Known; bytes.len()]);
-
-        // Initialize the history for each address
-        for offset in 0..bytes.len() {
-            let curr_addr = address + offset as u64;
-            byte_history.entry(curr_addr).or_default();
-
-            if matches!(access, MemoryAccess::Read) {
-                memory_reads.entry(curr_addr).or_default();
-            } else if matches!(access, MemoryAccess::Read) {
-                memory_writes.entry(curr_addr).or_default();
-            }
+        {
+            timeloop::scoped_timer!(crate::Timer::Memory_SetBytes1);
+            self.memory[page_index][offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
+        {
+            timeloop::scoped_timer!(crate::Timer::Memory_SetBytes2);
+            self.byte_state[page_index][offset..offset + bytes.len()]
+                .copy_from_slice(&vec![ByteState::Known; bytes.len()]);
         }
 
         // Set the requested bytes to the memory
@@ -105,18 +101,26 @@ impl Memory {
             let curr_addr = address + index as u64;
 
             // Mark this byte in the history for this instruction index
-            let (indexes, bytes) = byte_history.get_mut(&curr_addr).unwrap();
+            let (indexes, bytes) = byte_history.entry(curr_addr).or_insert_with(|| {
+                (
+                    ready_vec_instr_index.pop().unwrap_or_default(),
+                    ready_vec_bytes.pop().unwrap_or_default(),
+                )
+            });
 
             if *indexes.last().unwrap_or(&0) <= instr_index {
                 indexes.push(instr_index);
                 bytes.push(*byte);
 
                 if matches!(access, MemoryAccess::Read) {
-                    memory_reads.entry(curr_addr).or_default().push(instr_index);
+                    memory_reads
+                        .entry(curr_addr)
+                        .or_insert_with(|| ready_vec_instr_index.pop().unwrap_or_default())
+                        .push(instr_index);
                 } else if matches!(access, MemoryAccess::Write) {
                     memory_writes
                         .entry(curr_addr)
-                        .or_default()
+                        .or_insert_with(|| ready_vec_instr_index.pop().unwrap_or_default())
                         .push(instr_index);
                 }
             }
@@ -138,8 +142,6 @@ impl Memory {
 
     /// Returns true if address..address + n straddles the given PAGE_SIZE
     pub fn is_straddling_page(&self, address: u64, n: u64) -> bool {
-        timeloop::scoped_timer!(crate::Timer::Memory_IsStraddlingPage);
-
         let curr_page = address & PAGE_MASK;
         let final_page = (address + n - 1) & PAGE_MASK;
         curr_page != final_page
@@ -148,8 +150,6 @@ impl Memory {
     /// Lookup the page index for the given address. If not found, allocates a page and returns
     /// the new page's address
     pub fn get_page_index(&mut self, address: u64) -> usize {
-        timeloop::scoped_timer!(crate::Timer::Memory_GetPageIndex);
-
         // Lookup the page index for this address
         for (index, page_table) in self.lookup_table_addresses.iter().enumerate() {
             if *page_table == address & PAGE_MASK {

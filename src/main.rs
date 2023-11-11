@@ -29,7 +29,7 @@ fn main() -> Result<(), timeturner::Error> {
 
 /// Drop into an interactive terminal for this debugger
 pub fn single_forward_step_test(dbg: &mut Debugger) {
-    const ITERS: usize = 100;
+    const ITERS: usize = 10000;
     let mut single_step = std::time::Duration::from_secs(0);
     let mut worst_single_step = std::time::Duration::from_secs(0);
     let mut best_single_step = std::time::Duration::from_secs(9999);
@@ -57,7 +57,7 @@ pub fn single_forward_step_test(dbg: &mut Debugger) {
 }
 
 pub fn single_backward_step_test(dbg: &mut Debugger) {
-    const ITERS: usize = 100;
+    const ITERS: usize = 10000;
     let mut avg = std::time::Duration::from_secs(0);
     let mut worst = std::time::Duration::from_secs(0);
     let mut best = std::time::Duration::from_secs(9999);
@@ -87,7 +87,7 @@ pub fn single_backward_step_test(dbg: &mut Debugger) {
 }
 
 pub fn goto_random_index_test(dbg: &mut Debugger) {
-    const ITERS: usize = 100;
+    const ITERS: usize = 25;
     let mut worst_move = (0, 0);
     let mut best_move = (0, 0);
 
