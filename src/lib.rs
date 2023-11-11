@@ -518,6 +518,7 @@ impl Debugger {
         // Write this debugger to disk
         dbg.save(&outfile);
 
+        // Pre-allocate
         dbg.preallocate();
 
         Ok(dbg)
@@ -536,6 +537,8 @@ impl Debugger {
     /// Save this debugger to disk
     pub fn save(&self, filename: &Path) {
         timeloop::scoped_timer!(Timer::SaveDebuggerToDisk);
+        assert!(self.ready_vec_instr_index.is_empty());
+        assert!(self.ready_vec_bytes.is_empty());
 
         // Write the serialized data to disk
         log::info!("Writing initialized debugger to disk: {filename:?}");
