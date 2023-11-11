@@ -18,11 +18,21 @@ fn main() -> Result<(), timeturner::Error> {
     let mut dbg = Debugger::from_file(&args.filename)?;
     println!("Reading file took: {:?}", start.elapsed());
 
-    single_forward_step_test(&mut dbg);
-    single_backward_step_test(&mut dbg);
-    goto_random_index_test(&mut dbg);
+    /*
+    for _ in 0..1 {
+        single_forward_step_test(&mut dbg);
+        single_backward_step_test(&mut dbg);
+        goto_random_index_test(&mut dbg);
+    }
 
     dbg.print_stats();
+    */
+
+    for i in [0, 1, 2, 3, 2, 1, 0] {
+        dbg.goto_index(i);
+        dbg.hexdump(0xcff70, 0x20);
+        dbg.print_context();
+    }
 
     Ok(())
 }

@@ -22,7 +22,7 @@ use std::path::Path;
 /// before heap allocating storage for the register diff
 const REGISTER_ENTRIES: usize = 10;
 
-type InstrIndex = u32;
+pub type InstrIndex = u32;
 
 timeloop::impl_enum!(
     #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -299,7 +299,7 @@ pub struct Debugger {
     /// The memory backing for the debugger
     pub memory: Memory,
 
-    /// The memory diff for this step
+    /// The memory diff for each step
     pub memory_diffs: Vec<MemoryData>,
 
     /// Memory snapshots used to restore quickly jump between
@@ -768,65 +768,6 @@ impl Debugger {
         self.memory.soft_reset();
     }
 
-    pub fn exec_command(&mut self, command: &str) -> Result<(), Error> {
-        timeloop::scoped_timer!(Timer::ExecCommand);
-        // log::info!("Executing command: {command}");
-
-        let mut args = command.trim().split(' ');
-        let command = args.next().unwrap();
-        let arg1 = args.next();
-        let arg2 = args.next();
-
-        match command {
-            "g" => {
-                let index = match arg1.ok_or(Error::MissingCommandArgument)? {
-                    "end" => self.entries - 1,
-                    x => x.parse::<InstrIndex>().unwrap(),
-                };
-
-                log::info!("GOTO {index}");
-                self.goto_index(index);
-            }
-            "memreads" => {
-                let arg1 = arg1.ok_or(Error::MissingCommandArgument)?;
-                let arg1 = arg1.replace("0x", "");
-                let address = u64::from_str_radix(&arg1, 16).unwrap();
-
-                let reads = self.get_address_reads(address);
-                println!("MEM READS {address:#x} | {reads:?}");
-            }
-            "memwrites" => {
-                let arg1 = arg1.ok_or(Error::MissingCommandArgument)?;
-                let arg1 = arg1.replace("0x", "");
-                let address = u64::from_str_radix(&arg1, 16).unwrap();
-
-                let writes = self.get_address_writes(address);
-                println!("MEM WRITES {address:#x} | {writes:?}");
-            }
-            "hexdump" => {
-                let arg1 = arg1.ok_or(Error::MissingCommandArgument)?;
-                let arg1 = arg1.replace("0x", "");
-                let address = u64::from_str_radix(&arg1, 16).unwrap();
-
-                let arg2 = arg2.ok_or(Error::MissingCommandArgument)?;
-                let arg2 = arg2.replace("0x", "");
-                let n = usize::from_str_radix(&arg2, 16).unwrap();
-
-                self.hexdump(address, n);
-            }
-            "c" => {}
-            "next" | "n" => self.step_forward(),
-            "sb" => self.step_backward(),
-            "stats" => self.print_stats(),
-            "q" => return Err(Error::Quit),
-            x => println!("Unknown command: {x}"),
-        }
-
-        // log::info!("Command took {:?}", start.elapsed());
-
-        Ok(())
-    }
-
     pub fn print_stats(&self) {
         timeloop::print!();
     }
@@ -1001,15 +942,15 @@ impl Debugger {
                         // AFTER the current instruction index, then this byte
                         // is unknown
                         if target_index < addresses[index] {
-                            log::debug!("  --> UNSET {:#x}", *addr);
+                            // log::debug!("  --> UNSET {:#x}", *addr);
                             self.memory
                                 .set_byte_state(*addr, memory::ByteState::Unknown);
-                            let bytes = self.memory.read(*addr, 4);
-                            log::debug!("  --> {:#x} UNSET {:x?}", *addr, bytes);
+                            // let bytes = self.memory.read(*addr, 4);
+                            // log::debug!("  --> {:#x} UNSET {:x?}", *addr, bytes);
                         } else {
                             // Value was found, use this index as the last byte in the history
                             let last_byte = bytes[index];
-                            log::debug!("  --> {last_write} ({last_byte:#x})");
+                            log::debug!("  --> 123 {last_write} ({last_byte:#x})");
 
                             self.memory.set_byte_state(*addr, memory::ByteState::Known);
                             self.memory.set_byte(*addr, last_byte);

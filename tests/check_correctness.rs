@@ -1,19 +1,20 @@
 //! Test to ensure that going between instruction traces is the same
 //! execution state as if the debugger was executed from the beginning.
 
-use timeturner::{memory::Memory, Debugger};
+use timeturner::{memory::Memory, Debugger, InstrIndex};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-const ITERS: &[usize] = &[0, 9, 0, 5, 9, 4, 1, 3, 5, 7, 9, 4, 0, 9, 0];
+const ITERS: &[InstrIndex] = &[0, 9, 0, 5, 9, 4, 1, 3, 5, 7, 9, 4, 0, 9, 0];
 
 /// Generate the snapshot locations based on the size of the test trace
-fn get_test_indexes(entries: usize) -> [usize; ITERS.len()] {
+fn get_test_indexes(entries: InstrIndex) -> [InstrIndex; ITERS.len()] {
     // Calculate the largest power of ten for the number of entries
-    let mut multiplier = 1_usize;
+    let mut multiplier = 1 as InstrIndex;
+
     for i in 1..32 {
-        let result = 10_usize.pow(i);
+        let result = (10 as InstrIndex).pow(i);
         if entries <= result {
             multiplier = result / 10;
             break;
@@ -38,14 +39,14 @@ fn get_test_indexes(entries: usize) -> [usize; ITERS.len()] {
 /// Get memory snapshots for the indexes in the ITERS.
 /// These will be compared during the test to confirm the memory
 /// is reverted properly.
-fn get_snapshots(file: &Path) -> BTreeMap<usize, Memory> {
+fn get_snapshots(file: &Path) -> BTreeMap<InstrIndex, Memory> {
     let mut dbg = Debugger::from_file(file).unwrap();
 
     // Get all of the unique indexes in order
     let locations = get_test_indexes(dbg.entries)
         .iter()
         .copied()
-        .collect::<BTreeSet<usize>>();
+        .collect::<BTreeSet<InstrIndex>>();
     let mut locations = locations.iter().collect::<Vec<_>>();
     locations.sort();
 
@@ -64,6 +65,8 @@ fn get_snapshots(file: &Path) -> BTreeMap<usize, Memory> {
 
 #[test]
 fn main() -> Result<(), timeturner::Error> {
+    env_logger::init();
+
     let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") else {
         panic!("Failed to get CARGO_MANIFEST_DIR");
     };
