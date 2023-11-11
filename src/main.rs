@@ -1,7 +1,7 @@
 use clap::Parser;
+use rand::RngCore;
 use timeturner::Debugger;
 
-use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -11,54 +11,113 @@ struct Args {
 }
 
 fn main() -> Result<(), timeturner::Error> {
+    env_logger::init();
     let args = Args::parse();
+
+    let start = std::time::Instant::now();
     let mut dbg = Debugger::from_file(&args.filename)?;
-    let mut test = dbg.clone();
+    println!("Reading file took: {:?}", start.elapsed());
 
-    println!(
-        "Size: {} MB Entries: {} Bytes/Entry: {}",
-        dbg.size() as f64 / 1024 as f64 / 1024 as f64,
-        dbg.entries,
-        dbg.size() as f64 / dbg.entries as f64
-    );
-
-    let offset = 12000;
-
-    // let mut commands = Vec::new();
-    dbg.goto_index(10 * offset);
-
-    for next_index in [0, 9, 1, 8, 1, 9] {
-        let next_index = next_index * offset;
-        println!("GOING {} to {next_index}", dbg.index);
-
-        dbg.goto_index(next_index);
-
-        test.reset();
-        test.goto_index(next_index);
-
-        assert!(dbg.index == next_index);
-        assert!(dbg.index == test.index);
-        test.memory.diff(&dbg.memory);
-    }
-
-    let _ = dbg.exec_command("stats");
+    single_forward_step_test(&mut dbg);
+    single_backward_step_test(&mut dbg);
+    goto_random_index_test(&mut dbg);
 
     Ok(())
 }
 
 /// Drop into an interactive terminal for this debugger
-pub fn interactive(dbg: &mut Debugger) -> Result<(), ()> {
-    loop {
-        dbg.context_at(dbg.index);
-        print!("(timeturner:{}) ", dbg.index);
-        std::io::stdout().flush().unwrap();
+pub fn single_forward_step_test(dbg: &mut Debugger) {
+    const ITERS: usize = 100;
+    let mut single_step = std::time::Duration::from_secs(0);
+    let mut worst_single_step = std::time::Duration::from_secs(0);
+    let mut best_single_step = std::time::Duration::from_secs(9999);
 
-        let mut command = String::new();
+    for _ in 0..ITERS {
+        let start = std::time::Instant::now();
 
-        std::io::stdin()
-            .read_line(&mut command)
-            .expect("Failed to get command");
+        dbg.step_forward();
 
-        dbg.exec_command(command.trim())?;
+        let elapsed = start.elapsed();
+        if elapsed > worst_single_step {
+            worst_single_step = elapsed;
+        }
+        if elapsed < best_single_step {
+            best_single_step = elapsed;
+        }
+
+        single_step += elapsed;
     }
+
+    log::info!("Single Step Forward");
+    log::info!("Best:  {:.4?}", best_single_step);
+    log::info!("Avg:   {:.4?}", single_step / ITERS.try_into().unwrap());
+    log::info!("Worst: {:.4?}", worst_single_step);
+}
+
+pub fn single_backward_step_test(dbg: &mut Debugger) {
+    const ITERS: usize = 100;
+    let mut avg = std::time::Duration::from_secs(0);
+    let mut worst = std::time::Duration::from_secs(0);
+    let mut best = std::time::Duration::from_secs(9999);
+
+    dbg.goto_index(dbg.entries / 2);
+
+    for _ in 0..ITERS {
+        let start = std::time::Instant::now();
+
+        dbg.step_backward();
+
+        let elapsed = start.elapsed();
+        if elapsed > worst {
+            worst = elapsed;
+        }
+        if elapsed < best {
+            best = elapsed;
+        }
+
+        avg += elapsed;
+    }
+
+    log::info!("Single Step Backward");
+    log::info!("Best:  {:.4?}", best);
+    log::info!("Avg:   {:.4?}", avg / ITERS.try_into().unwrap());
+    log::info!("Worst: {:.4?}", worst);
+}
+
+pub fn goto_random_index_test(dbg: &mut Debugger) {
+    const ITERS: usize = 100;
+    let mut worst_move = (0, 0);
+    let mut best_move = (0, 0);
+
+    let mut avg = std::time::Duration::from_secs(0);
+    let mut worst = std::time::Duration::from_secs(0);
+    let mut best = std::time::Duration::from_secs(9999);
+    let mut rng = rand::thread_rng();
+
+    dbg.goto_index(dbg.entries / 2);
+
+    for _ in 0..ITERS {
+        let start = std::time::Instant::now();
+        let starting_index = dbg.index;
+
+        let next_index = rng.next_u32() % dbg.entries;
+        dbg.goto_index(next_index);
+
+        let elapsed = start.elapsed();
+        if elapsed > worst {
+            worst = elapsed;
+            worst_move = (starting_index, next_index);
+        }
+        if elapsed < best {
+            best = elapsed;
+            best_move = (starting_index, next_index);
+        }
+
+        avg += elapsed;
+    }
+
+    log::info!("Random index");
+    log::info!("Best:  {:.4?} {best_move:?}", best);
+    log::info!("Avg:   {:.4?}", avg / ITERS.try_into().unwrap());
+    log::info!("Worst: {:.4?} {worst_move:?}", worst);
 }

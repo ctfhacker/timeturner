@@ -1,9 +1,10 @@
-use crate::{MemoryAccess, Timer};
+use crate::{InstrIndex, MemoryAccess};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// The size of each memory page that the debugger knows about. Must
 /// be a power of two.
-const PAGE_SIZE: u64 = 4096 * 4096;
+const PAGE_SIZE: u64 = 8 * 1024;
 
 /// The mask used to get the beginning of a page using a bitwise and.
 ///
@@ -17,7 +18,7 @@ const PAGE_MASK: u64 = !OFFSET_MASK;
 // Ensure page size is power of two
 const _: () = assert!(PAGE_SIZE.is_power_of_two());
 
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub enum ByteState {
     #[default]
     Unknown,
@@ -25,7 +26,7 @@ pub enum ByteState {
 }
 
 /// A memory backing
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
 pub struct Memory {
     /// Lookup table from masked address to the index into the memory list.
     ///
@@ -39,18 +40,6 @@ pub struct Memory {
 
     /// The memory tables in the debugger
     pub memory: Vec<Vec<u8>>,
-
-    /// The sequence of bytes written to each address
-    pub byte_history: BTreeMap<u64, (Vec<usize>, Vec<u8>)>,
-    // /// The memory reads found in the trace
-    // ///
-    // /// Key: Address Val: The index in the trace where this read occurred
-    // pub memory_reads: BTreeMap<u64, Vec<usize>>,
-
-    // /// The memory writes of each address found in the trace
-    // ///
-    // /// Key: Address Val: The index in the trace where this read occurred
-    // pub memory_writes: BTreeMap<u64, Vec<usize>>,
 }
 
 impl Memory {
@@ -73,13 +62,14 @@ impl Memory {
     /// Set the current memory address with the given bytes
     pub fn set_bytes(
         &mut self,
-        instr_index: usize,
+        instr_index: InstrIndex,
         address: u64,
         bytes: &[u8],
         access: MemoryAccess,
+        memory_reads: &mut BTreeMap<u64, Vec<InstrIndex>>,
+        memory_writes: &mut BTreeMap<u64, Vec<InstrIndex>>,
+        byte_history: &mut BTreeMap<u64, (Vec<InstrIndex>, Vec<u8>)>,
     ) {
-        timeloop::scoped_timer!(Timer::Memory_SetBytes);
-
         if self.is_straddling_page(address, bytes.len() as u64) {
             panic!("Address straddles memory: {address:#x} {bytes:x?}");
         }
@@ -87,25 +77,47 @@ impl Memory {
         // Get the page index for this address
         let page_index = self.get_page_index(address);
 
-        // Set the requested bytes to the memory
+        // Get the offset
         let offset = (address & OFFSET_MASK) as usize;
-        for (index, byte) in bytes.iter().enumerate() {
-            self.memory[page_index][offset + index] = *byte;
-            self.byte_state[page_index][offset + index] = ByteState::Known;
 
+        // Copy the known bytes into memory and set them as known
+        self.memory[page_index][offset..offset + bytes.len()].copy_from_slice(bytes);
+        self.byte_state[page_index][offset..offset + bytes.len()]
+            .copy_from_slice(&vec![ByteState::Known; bytes.len()]);
+
+        // Initialize the history for each address
+        for offset in 0..bytes.len() {
+            let curr_addr = address + offset as u64;
+            byte_history.entry(curr_addr).or_default();
+
+            if matches!(access, MemoryAccess::Read) {
+                memory_reads.entry(curr_addr).or_default();
+            } else if matches!(access, MemoryAccess::Read) {
+                memory_writes.entry(curr_addr).or_default();
+            }
+        }
+
+        // Set the requested bytes to the memory
+        for (index, byte) in bytes.iter().enumerate() {
             // Setup the byte_history
             //
             // If this address hasn't been seen yet, and it was just read, then that byte starts.
             let curr_addr = address + index as u64;
-            if matches!(access, MemoryAccess::Read) && !self.byte_history.contains_key(&curr_addr) {
-                self.byte_history
-                    .insert(curr_addr, (vec![(0)], vec![*byte]));
-            } else {
-                let (indexes, bytes) = self.byte_history.entry(curr_addr).or_default();
 
-                if *indexes.last().unwrap_or(&0) < instr_index {
-                    indexes.push(instr_index);
-                    bytes.push(*byte);
+            // Mark this byte in the history for this instruction index
+            let (indexes, bytes) = byte_history.get_mut(&curr_addr).unwrap();
+
+            if *indexes.last().unwrap_or(&0) <= instr_index {
+                indexes.push(instr_index);
+                bytes.push(*byte);
+
+                if matches!(access, MemoryAccess::Read) {
+                    memory_reads.entry(curr_addr).or_default().push(instr_index);
+                } else if matches!(access, MemoryAccess::Write) {
+                    memory_writes
+                        .entry(curr_addr)
+                        .or_default()
+                        .push(instr_index);
                 }
             }
         }
@@ -163,6 +175,11 @@ impl Memory {
 
         let mut result = Vec::with_capacity(n);
         for byte_index in offset..offset + n {
+            log::debug!(
+                "Reading {page_index} {byte_index:#x} -> {:?}",
+                self.byte_state[page_index][byte_index]
+            );
+
             if matches!(self.byte_state[page_index][byte_index], ByteState::Unknown) {
                 result.push(None);
             } else {
@@ -196,6 +213,7 @@ impl Memory {
                 println!();
                 print!("{:#018x} | ", address as usize + index);
             }
+
             match byte {
                 Some(byte) => print!("{byte:02x} "),
                 None => print!("?? "),
@@ -212,9 +230,18 @@ impl Memory {
                     continue;
                 }
 
-                // println!("Page: {page_index:#x} Byte index: {byte_index:#x}");
-                // dbg!(self.memory[page_index][byte_index]);
-                // dbg!(other.memory[page_index][byte_index]);
+                log::debug!(
+                    "Curr state {:?} Other state: {:?}",
+                    self.byte_state[page_index][byte_index],
+                    other.byte_state[page_index][byte_index]
+                );
+
+                log::debug!("Page: {page_index:#x} Byte index: {byte_index:#x}");
+                log::debug!(
+                    "Curr byte: {:x?} Other byte: {:x?}",
+                    self.memory[page_index][byte_index],
+                    other.memory[page_index][byte_index]
+                );
 
                 assert!(
                     self.memory[page_index][byte_index] == other.memory[page_index][byte_index]
