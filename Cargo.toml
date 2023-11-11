@@ -15,7 +15,8 @@ log = "0.4.20"
 rand = "0.8.5"
 rmp-serde = "1.1.2"
 serde = { version = "1.0.192", features = ["derive"] }
-timeloop = { version = "0.1.0", git = "https://github.com/ctfhacker/timeloop", default-features = false, features = ["disable"] }
+# timeloop = { version = "0.1.0", git = "https://github.com/ctfhacker/timeloop", default-features = false, features = ["disable"] }
+timeloop = { version = "0.1.0", git = "https://github.com/ctfhacker/timeloop" }
 
 [profile.release]
 panic = "abort"

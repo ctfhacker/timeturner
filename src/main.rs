@@ -22,6 +22,8 @@ fn main() -> Result<(), timeturner::Error> {
     single_backward_step_test(&mut dbg);
     goto_random_index_test(&mut dbg);
 
+    dbg.print_stats();
+
     Ok(())
 }
 
