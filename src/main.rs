@@ -48,10 +48,10 @@ pub fn single_forward_step_test(dbg: &mut Debugger) {
         single_step += elapsed;
     }
 
-    log::info!("Single Step Forward");
-    log::info!("Best:  {:.4?}", best_single_step);
-    log::info!("Avg:   {:.4?}", single_step / ITERS.try_into().unwrap());
-    log::info!("Worst: {:.4?}", worst_single_step);
+    println!("--- Single Step Forward ---");
+    println!("Best:  {:.4?}", best_single_step);
+    println!("Avg:   {:.4?}", single_step / ITERS.try_into().unwrap());
+    println!("Worst: {:.4?}", worst_single_step);
 }
 
 pub fn single_backward_step_test(dbg: &mut Debugger) {
@@ -78,10 +78,10 @@ pub fn single_backward_step_test(dbg: &mut Debugger) {
         avg += elapsed;
     }
 
-    log::info!("Single Step Backward");
-    log::info!("Best:  {:.4?}", best);
-    log::info!("Avg:   {:.4?}", avg / ITERS.try_into().unwrap());
-    log::info!("Worst: {:.4?}", worst);
+    println!("--- Single Step Backward ---");
+    println!("Best:  {:.4?}", best);
+    println!("Avg:   {:.4?}", avg / ITERS.try_into().unwrap());
+    println!("Worst: {:.4?}", worst);
 }
 
 pub fn goto_random_index_test(dbg: &mut Debugger) {
@@ -116,8 +116,8 @@ pub fn goto_random_index_test(dbg: &mut Debugger) {
         avg += elapsed;
     }
 
-    log::info!("Random index");
-    log::info!("Best:  {:.4?} {best_move:?}", best);
-    log::info!("Avg:   {:.4?}", avg / ITERS.try_into().unwrap());
-    log::info!("Worst: {:.4?} {worst_move:?}", worst);
+    println!("--- Random index ---");
+    println!("Best:  {:.4?} {best_move:?}", best);
+    println!("Avg:   {:.4?}", avg / ITERS.try_into().unwrap());
+    println!("Worst: {:.4?} {worst_move:?}", worst);
 }
