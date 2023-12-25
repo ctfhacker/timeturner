@@ -43,7 +43,7 @@ pub struct Memory {
     pub lookup_table_addresses: Vec<u64>,
 
     /// The state of each byte in memory
-    pub byte_state: Vec<Vec<PackedByteState>>,
+    // pub byte_state: Vec<Vec<PackedByteState>>,
 
     /// The memory tables in the debugger
     pub memory: Vec<Vec<u8>>,
@@ -54,12 +54,15 @@ impl Memory {
     pub fn soft_reset(&mut self) {
         timeloop::scoped_timer!(crate::Timer::Memory_SoftReset);
 
+        /*
         self.byte_state
             .iter_mut()
             .for_each(|page| *page = vec![0; PAGE_SIZE as usize / PACKED_BYTE_STATE_SIZE])
+        */
     }
 
     /// Set the byte at the given address to the given state
+    /*
     pub fn set_byte_state(&mut self, address: u64, state: ByteState) {
         let page_index = self.get_page_index(address);
 
@@ -73,8 +76,10 @@ impl Memory {
             self.byte_state[page_index][byte_index] &= !(1 << bit_index);
         }
     }
+    */
 
     /// Set the byte at the given address to the given state
+    /*
     pub fn get_byte_state(&mut self, address: u64) -> ByteState {
         let page_index = self.get_page_index(address);
 
@@ -88,9 +93,12 @@ impl Memory {
             ByteState::Unknown
         }
     }
+    */
 
     pub fn write_bytes(&mut self, mut address: u64, bytes: &[u8]) {
-        log::info!("Writing: {address:#x} bytes {bytes:x?}");
+        timeloop::scoped_timer!(crate::Timer::Memory_WriteBytes);
+
+        // log::info!("Writing: {address:#x} bytes {bytes:x?}");
         let mut byte_pos = 0;
         let n = bytes.len();
         let ending_addr = address + n as u64;
@@ -103,17 +111,22 @@ impl Memory {
             let offset = (address & OFFSET_MASK) as usize;
 
             // Copy the bytes into this page
+            /*
             log::info!(
                 "WRITING {address:#x} {:x?}",
                 &bytes[byte_pos..byte_pos + curr_len as usize]
             );
+            */
+
             self.memory[page_index][offset..offset + curr_len as usize]
                 .copy_from_slice(&bytes[byte_pos..byte_pos + curr_len as usize]);
 
             // Set the state of these bytes to known
+            /*
             for addr in address..address + curr_len {
                 self.set_byte_state(addr, ByteState::Known);
             }
+            */
 
             address += curr_len;
             byte_pos += curr_len as usize;
@@ -135,7 +148,7 @@ impl Memory {
     ) {
         // Copy the known bytes into memory and set them as known
         timeloop::scoped_timer!(crate::Timer::Memory_SetBytes1);
-        self.write_bytes(address, bytes);
+        // self.write_bytes(address, bytes);
 
         // Set the requested bytes to the memory
         for (index, byte) in bytes.iter().enumerate() {
@@ -181,7 +194,7 @@ impl Memory {
         self.memory[page_index][offset] = byte;
 
         // Set the byte state as known for this byte
-        self.set_byte_state(address, ByteState::Known);
+        // self.set_byte_state(address, ByteState::Known);
     }
 
     /// Lookup the page index for the given address. If not found, allocates a page and returns
@@ -203,7 +216,7 @@ impl Memory {
     }
 
     /// Read n bytes from the given address
-    pub fn read(&mut self, mut address: u64, n: usize) -> Vec<Option<u8>> {
+    pub fn read(&mut self, mut address: u64, n: usize) -> Vec<u8> {
         timeloop::scoped_timer!(crate::Timer::Memory_Read);
 
         let mut result = Vec::with_capacity(n);
@@ -216,14 +229,18 @@ impl Memory {
 
             for i in 0..curr_len {
                 let curr_addr = address + i as u64;
+                let byte_index = (curr_addr & OFFSET_MASK) as usize;
+
+                /*
                 let access = self.get_byte_state(curr_addr);
 
                 if matches!(access, ByteState::Unknown) {
                     result.push(None);
                 } else {
-                    let byte_index = (curr_addr & OFFSET_MASK) as usize;
                     result.push(Some(self.memory[page_index][byte_index]));
                 }
+                */
+                result.push(self.memory[page_index][byte_index]);
             }
 
             // Update the address to the next page
@@ -241,7 +258,7 @@ impl Memory {
 
         let new_index = self.memory.len();
         self.memory.push(new_memory);
-        self.byte_state.push(new_memory_states);
+        // self.byte_state.push(new_memory_states);
         new_index
     }
 
@@ -257,42 +274,24 @@ impl Memory {
                 print!("{:#018x} | ", address as usize + index);
             }
 
+            /*
             match byte {
                 Some(byte) => print!("{byte:02x} "),
                 None => print!("?? "),
             }
+            */
+            print!("{byte:02x} ");
         }
 
         println!();
     }
 
     pub fn diff(&self, other: &Memory) {
-        for (page_index, page) in self.byte_state.iter().enumerate() {
+        for (page_index, page) in self.memory.iter().enumerate() {
             for (byte_index, byte) in page.iter().enumerate() {
-                for bit in 0..PACKED_BYTE_STATE_SIZE {
-                    let known = byte & (1 << bit) > 0;
-                    if !known {
-                        continue;
-                    }
-
-                    log::debug!(
-                        "Curr state {:?} Other state: {:?}",
-                        self.byte_state[page_index][byte_index],
-                        other.byte_state[page_index][byte_index]
-                    );
-
-                    log::debug!("Page: {page_index:#x} Byte index: {byte_index:#x}");
-                    log::debug!(
-                        "Curr byte: {:x?} Other byte: {:x?}",
-                        self.memory[page_index][byte_index],
-                        other.memory[page_index][byte_index]
-                    );
-
-                    let byte_index = byte_index * PACKED_BYTE_STATE_SIZE + bit;
-                    assert!(
-                        self.memory[page_index][byte_index] == other.memory[page_index][byte_index]
-                    );
-                }
+                assert!(
+                    self.memory[page_index][byte_index] == other.memory[page_index][byte_index]
+                );
             }
         }
     }

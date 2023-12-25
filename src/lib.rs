@@ -11,6 +11,7 @@ use gzp::{deflate::Gzip, ZBuilder};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::Arc;
 
 use memory::Memory;
 use utils::parse_hex_string;
@@ -77,6 +78,7 @@ timeloop::impl_enum!(
         Memory_SoftReset,
         Memory_SetByte,
         Memory_CheckNewInstrIndex,
+        Memory_WriteBytes,
 
         Memory_SetBytes1,
         Memory_SetBytes2,
@@ -95,7 +97,7 @@ timeloop::create_profiler!(Timer);
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
-    ParseIntError(std::num::ParseIntError),
+    ParseIntError(String),
     Bincode(Box<bincode::ErrorKind>),
     InvalidMemoryValue(String),
     AddMemory,
@@ -181,6 +183,41 @@ impl Register {
             _ => unreachable!(),
         }
     }
+
+    pub fn from_str(input: &str) -> Option<Self> {
+        match input {
+            "rax" => Some(Register::Rax),
+            "rbx" => Some(Register::Rbx),
+            "rcx" => Some(Register::Rcx),
+            "rdx" => Some(Register::Rdx),
+            "rsi" => Some(Register::Rsi),
+            "rdi" => Some(Register::Rdi),
+            "rip" => Some(Register::Rip),
+            "rsp" => Some(Register::Rsp),
+            "rbp" => Some(Register::Rbp),
+            "r8" => Some(Register::R8),
+            "r9" => Some(Register::R9),
+            "r10" => Some(Register::R10),
+            "r11" => Some(Register::R11),
+            "r12" => Some(Register::R12),
+            "r13" => Some(Register::R13),
+            "r14" => Some(Register::R14),
+            "r15" => Some(Register::R15),
+
+            "eax" => Some(Register::Eax),
+            "ebx" => Some(Register::Ebx),
+            "ecx" => Some(Register::Ecx),
+            "edx" => Some(Register::Edx),
+            "esi" => Some(Register::Esi),
+            "edi" => Some(Register::Edi),
+            "dx" => Some(Register::Dx),
+            "dl" => Some(Register::Dl),
+            "eip" => Some(Register::Eip),
+            "esp" => Some(Register::Esp),
+            "ebp" => Some(Register::Ebp),
+            _ => None,
+        }
+    }
 }
 
 #[repr(u8)]
@@ -192,14 +229,27 @@ pub enum MemoryAccess {
     None,
     Read,
     Write,
+    ReadWrite,
 }
 
 /// The set of memory data diffs per line in the trace
-#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct MemoryData {
     addresses: Vec<u64>,
     bytes: Vec<Vec<u8>>,
     accesses: Vec<MemoryAccess>,
+    num_bytes: Vec<u8>,
+}
+
+impl std::default::Default for MemoryData {
+    fn default() -> Self {
+        Self {
+            addresses: Vec::with_capacity(8),
+            bytes: Vec::with_capacity(8),
+            accesses: Vec::with_capacity(8),
+            num_bytes: Vec::with_capacity(8),
+        }
+    }
 }
 
 impl std::fmt::Debug for MemoryData {
@@ -208,10 +258,12 @@ impl std::fmt::Debug for MemoryData {
             addresses,
             bytes,
             accesses,
+            num_bytes,
         } = self;
         for (index, access) in accesses.iter().enumerate() {
             let address = addresses[index];
             let curr_bytes = &bytes[index];
+            let curr_num_bytes = num_bytes[index];
 
             let operation = match access {
                 MemoryAccess::Write => "<-",
@@ -219,9 +271,9 @@ impl std::fmt::Debug for MemoryData {
                 _ => unreachable!(),
             };
 
-            write!(f, "{access:?} {address:#x} {operation} ")?;
+            write!(f, "{access:?} {address:#x} {operation} {curr_num_bytes}")?;
 
-            for byte in curr_bytes {
+            for byte in curr_bytes.iter().take(curr_num_bytes.into()) {
                 write!(f, "{byte:02x}")?;
             }
 
@@ -243,6 +295,7 @@ pub struct MemoryDataItem<'a> {
     address: u64,
     bytes: &'a [u8],
     access: MemoryAccess,
+    num_bytes: u8,
 }
 
 // Implement `Iterator` for the iterator struct
@@ -254,6 +307,7 @@ impl<'a> Iterator for MemoryDataIter<'a> {
             addresses,
             bytes,
             accesses,
+            num_bytes,
         } = self.memory_data;
 
         if self.index < addresses.len() && !matches!(accesses[self.index], MemoryAccess::None) {
@@ -261,6 +315,7 @@ impl<'a> Iterator for MemoryDataIter<'a> {
                 address: addresses[self.index],
                 bytes: bytes[self.index].as_slice(),
                 access: accesses[self.index],
+                num_bytes: num_bytes[self.index],
             };
 
             self.index += 1;
@@ -280,11 +335,27 @@ impl MemoryData {
         }
     }
 
-    // Clear the contents
+    /// Add a new element into the memory data
+    pub fn add(&mut self, address: u64, bytes: Vec<u8>, access: MemoryAccess, num_bytes: u8) {
+        self.addresses.push(address);
+        self.bytes.push(bytes);
+        self.accesses.push(access);
+        self.num_bytes.push(num_bytes);
+    }
+
+    // Clear the contents of this memory data
     pub fn clear(&mut self) {
-        self.addresses.clear();
-        self.bytes.clear();
-        self.accesses.clear();
+        let Self {
+            addresses,
+            bytes,
+            accesses,
+            num_bytes,
+        } = self;
+
+        addresses.clear();
+        bytes.clear();
+        accesses.clear();
+        num_bytes.clear();
     }
 }
 
@@ -307,7 +378,7 @@ pub struct Debugger {
     memory_snapshots: BTreeMap<InstrIndex, Memory>,
 
     /// The distance between each memory snapshot
-    memory_snapshot_delta: InstrIndex,
+    pub memory_snapshot_delta: InstrIndex,
 
     /// The instruction index of the register writes
     pub register_writes: [Vec<InstrIndex>; Register::count()],
@@ -321,6 +392,9 @@ pub struct Debugger {
     /// The memory writes of each address found in the trace
     pub memory_writes: BTreeMap<u64, Vec<InstrIndex>>,
 
+    /// The addresses executed in the trace
+    pub rips: BTreeMap<u64, Vec<InstrIndex>>,
+
     /// The sequence of bytes written to each address
     pub byte_history: BTreeMap<u64, (Vec<InstrIndex>, Vec<u8>)>,
 
@@ -329,6 +403,9 @@ pub struct Debugger {
 
     /// Pre-allocated vecs ready for use for bytes
     pub ready_vec_bytes: Vec<Vec<u8>>,
+
+    /// Has the debugger caches been initialized
+    pub caches_initialized: bool,
 }
 
 impl Debugger {
@@ -350,7 +427,7 @@ impl Debugger {
 
             // If restoring the debugger ttdbg, then return the result
             if let Ok(mut res) = Debugger::restore(&input) {
-                res.size();
+                // res.size();
                 res.preallocate();
                 return Ok(res);
             }
@@ -360,129 +437,201 @@ impl Debugger {
             log::info!("..Failed to load from ttdbg, returning to parsing the raw trace {input:?}");
         }
 
-        log::info!("Input: {input:?}");
-        let mut reader = BufReader::new(File::open(input).unwrap());
+        log::info!("Gathering lines");
+        let start = std::time::Instant::now();
+        let mut reader = BufReader::new(File::open(&input).unwrap());
+        let lines = reader.lines().flat_map(|x| x).collect::<Vec<_>>();
+        let num_lines = lines.len();
+        log::info!("Input Lines: {num_lines}");
+        log::info!("READ: {:?}", start.elapsed());
 
+        let mut reader = BufReader::new(File::open(&input).unwrap());
         let mut dbg = Debugger::default();
         let start = std::time::Instant::now();
         let mut timer = std::time::Instant::now();
-        let mut line = String::new();
-        let mut diff = TraceDiff::<REGISTER_ENTRIES>::default();
         let mut i = 0;
+        let num_cores = 8;
+        let line_delta = num_lines / num_cores;
+        let lines = Arc::new(lines);
 
-        timeloop::scoped_timer!(Timer::AddDiffs);
-        loop {
-            line.clear();
-            diff.clear();
+        fn parse_file_thread(
+            core_id: usize,
+            lines: Arc<Vec<String>>,
+            start_index: usize,
+            num_lines: usize,
+        ) -> Result<Vec<TraceDiff<REGISTER_ENTRIES>>, Error> {
+            let start = std::time::Instant::now();
+            let mut timer = std::time::Instant::now();
+            let mut line = String::new();
+            let mut results = Vec::new();
+            timeloop::scoped_timer!(Timer::AddDiffs);
 
-            let bytes_read = reader.read_line(&mut line).map_err(Error::Io)?;
-            if bytes_read == 0 {
-                break;
-            }
+            let mut diffs = (0..num_lines)
+                .map(|_| TraceDiff::<REGISTER_ENTRIES>::default())
+                .collect::<Vec<_>>();
 
-            if timer.elapsed() > std::time::Duration::from_secs(1) {
-                let virt_mem_bytes = get_virtual_mem();
+            for index in start_index..start_index + num_lines {
+                let line = &lines[index];
 
-                log::info!(
-                    "Line: {i} | {:.2} M lines/sec | {:.2} bytes / line",
-                    (i as f64 / start.elapsed().as_secs_f64()) / 1000. / 1000.,
-                    virt_mem_bytes as f64 / i as f64,
-                    // dbg.size() as f64 / 1024. / 1024. / 1024.
-                );
+                if line.is_empty() {
+                    continue;
+                }
 
-                timer = std::time::Instant::now();
-                // dbg.print_stats();
-            }
+                let mut diff = diffs.pop().unwrap();
 
-            i += 1;
+                if timer.elapsed() > std::time::Duration::from_millis(100) {
+                    let virt_mem_bytes = get_virtual_mem();
 
-            'next_item: for item in line.split(',') {
-                // Parse all of the register entries
-                if &item[..1] == "r" || &item[..1] == "e" {
-                    for (prefix, register) in [
-                        ("rax=", Register::Rax),
-                        ("eax=", Register::Eax),
-                        ("rbx=", Register::Rbx),
-                        ("ebx=", Register::Ebx),
-                        ("rcx=", Register::Rcx),
-                        ("ecx=", Register::Ecx),
-                        ("rdx=", Register::Rdx),
-                        ("edx=", Register::Edx),
-                        ("rdi=", Register::Rdi),
-                        ("edi=", Register::Edi),
-                        ("rsi=", Register::Rsi),
-                        ("esi=", Register::Esi),
-                        ("rsp=", Register::Rsp),
-                        ("esp=", Register::Esp),
-                        ("rbp=", Register::Rbp),
-                        ("ebp=", Register::Ebp),
-                        ("rip=", Register::Rip),
-                        ("eip=", Register::Eip),
-                        ("r8=", Register::R8),
-                        ("r9=", Register::R9),
-                        ("r10=", Register::R10),
-                        ("r11=", Register::R11),
-                        ("r12=", Register::R12),
-                        ("r13=", Register::R13),
-                        ("r14=", Register::R14),
-                        ("r15=", Register::R15),
-                    ] {
-                        if &item[..prefix.len()] == prefix {
-                            let value = &item[prefix.len()..];
-                            let value = parse_hex_string(value)?;
-                            diff.set_register(register, value);
+                    log::info!(
+                        "Line: {index}/{} | {:.2} M lines/sec | {:.2} bytes / line",
+                        start_index + num_lines,
+                        ((index - start_index) as f64 / start.elapsed().as_secs_f64())
+                            / 1000.
+                            / 1000.,
+                        virt_mem_bytes as f64 / (index - start_index) as f64,
+                        // dbg.size() as f64 / 1024. / 1024. / 1024.
+                    );
+
+                    timer = std::time::Instant::now();
+                }
+
+                'next_item: for item in line.split(',') {
+                    // Parse all of the register entries
+                    if &item[..1] == "r" || &item[..1] == "e" {
+                        for (prefix, register) in [
+                            ("rax=", Register::Rax),
+                            ("eax=", Register::Eax),
+                            ("rbx=", Register::Rbx),
+                            ("ebx=", Register::Ebx),
+                            ("rcx=", Register::Rcx),
+                            ("ecx=", Register::Ecx),
+                            ("rdx=", Register::Rdx),
+                            ("edx=", Register::Edx),
+                            ("rdi=", Register::Rdi),
+                            ("edi=", Register::Edi),
+                            ("rsi=", Register::Rsi),
+                            ("esi=", Register::Esi),
+                            ("rsp=", Register::Rsp),
+                            ("esp=", Register::Esp),
+                            ("rbp=", Register::Rbp),
+                            ("ebp=", Register::Ebp),
+                            ("rip=", Register::Rip),
+                            ("eip=", Register::Eip),
+                            ("r8=", Register::R8),
+                            ("r9=", Register::R9),
+                            ("r10=", Register::R10),
+                            ("r11=", Register::R11),
+                            ("r12=", Register::R12),
+                            ("r13=", Register::R13),
+                            ("r14=", Register::R14),
+                            ("r15=", Register::R15),
+                        ] {
+                            if &item[..prefix.len()] == prefix {
+                                let value = &item[prefix.len()..];
+                                let value = parse_hex_string(value)?;
+                                diff.set_register(register, value);
+                                continue 'next_item;
+                            }
+                        }
+                    }
+
+                    // Parse for a memory operation next
+                    for (prefix, memory) in
+                        [("mr=", MemoryAccess::Read), ("mw=", MemoryAccess::Write)]
+                    {
+                        if let Some(mem_value) = item.strip_prefix(prefix) {
+                            let mut mem = mem_value.split(':');
+                            let Some(addr) = mem.next() else {
+                                return Err(Error::InvalidMemoryValue(mem_value.to_string()));
+                            };
+
+                            let Some(value) = mem.next() else {
+                                return Err(Error::InvalidMemoryValue(mem_value.to_string()));
+                            };
+
+                            let mut new_value = [0; 16];
+                            let addr = parse_hex_string(addr)?;
+                            let num_bytes: u8;
+
+                            if let Some(num_bytes_str) = value.strip_prefix('s') {
+                                // Parse: 0xdeadbeef:s8
+                                // Memory access at 0xdeadbeef for 8 bytes
+                                num_bytes = num_bytes_str
+                                    .parse::<u8>()
+                                    .map_err(|_| Error::ParseIntError(value.to_string()))?;
+                            } else {
+                                // Parse: 0xdeadbeef:12345678
+                                // Memory access at 0xdeadbeef for bytes [0x12, 0x34, 0x56, x78]
+                                num_bytes = value.len() as u8 / 2;
+
+                                for i in 0..num_bytes as usize {
+                                    let range = i * 2..i * 2 + 2;
+                                    new_value[i] = u8::from_str_radix(
+                                        value.get(range).unwrap_or_else(|| "00"),
+                                        16,
+                                    )
+                                    .unwrap();
+                                }
+                            }
+
+                            // Add the parsed memory to the diff
+                            diff.add_memory(addr, num_bytes, new_value, memory)?;
                             continue 'next_item;
                         }
                     }
+
+                    panic!("unknown item: {item}");
                 }
 
-                // Parse for a memory operation next
-                for (prefix, memory) in [("mr=", MemoryAccess::Read), ("mw=", MemoryAccess::Write)]
-                {
-                    if let Some(mem_value) = item.strip_prefix(prefix) {
-                        let mut mem = mem_value.split(':');
-                        let Some(addr) = mem.next() else {
-                            return Err(Error::InvalidMemoryValue(mem_value.to_string()));
-                        };
-                        let Some(value) = mem.next() else {
-                            return Err(Error::InvalidMemoryValue(mem_value.to_string()));
-                        };
-
-                        let addr = parse_hex_string(addr)?;
-
-                        let num_bytes = value.len() / 2;
-                        let mut new_value = [0; 8];
-                        for i in 0..8 {
-                            let range = i * 2..i * 2 + 2;
-                            new_value[i] =
-                                u8::from_str_radix(value.get(range).unwrap_or_else(|| "00"), 16)
-                                    .unwrap();
-                        }
-
-                        // Add the parsed memory to the diff
-                        diff.add_memory(addr, num_bytes as u8, new_value, memory)?;
-                        continue 'next_item;
-                    }
-                }
-
-                panic!("unknown item: {item}");
+                results.push(diff);
             }
 
-            dbg.add_diff(&diff);
-            dbg.entries += 1;
+            Ok(results)
         }
 
-        dbg.memory = Memory::default();
+        let mut threads = Vec::new();
+        for core_id in 0..num_cores {
+            let start_index = core_id * line_delta;
+            let lines = lines.clone();
+
+            let thread = std::thread::spawn(move || {
+                parse_file_thread(core_id, lines, start_index, line_delta)
+            });
+
+            threads.push(thread);
+        }
+
+        let start = std::time::Instant::now();
+        let mut core_id = 0;
+        for thread in threads {
+            match thread.join().unwrap() {
+                Ok(diffs) => {
+                    log::info!("Adding {} diffs from thread {}", diffs.len(), core_id);
+                    for diff in diffs {
+                        dbg.add_diff(&diff);
+                        dbg.entries += 1;
+                    }
+                }
+                Err(e) => {
+                    panic!("Thread failed: {e:?}")
+                }
+            }
+
+            core_id += 1;
+        }
+
+        log::info!("Loading diffs from tenet trace: {:?}", start.elapsed());
 
         {
             timeloop::scoped_timer!(Timer::TakeMemorySnapshots);
-
             log::info!("Taking memory snapshot");
+
+            dbg.memory = Memory::default();
 
             let start = std::time::Instant::now();
 
             // The number of memory snapshots to keep in memory
-            let divisions = 5;
+            let divisions = (dbg.entries / 250_000).max(1);
 
             let delta = dbg.entries / divisions;
             dbg.memory_snapshot_delta = delta;
@@ -500,6 +649,8 @@ impl Debugger {
 
             for entry in snapshot_locations {
                 log::info!("Taking snapshot at {entry}");
+                std::io::stdout().flush().unwrap();
+
                 dbg.goto_index(entry);
                 memory_snapshots.insert(entry, dbg.memory.clone());
             }
@@ -507,6 +658,9 @@ impl Debugger {
             // Keep a copy of the memory snapshots
             dbg.memory_snapshots = memory_snapshots;
             log::info!("Initialing memory took {:?}", start.elapsed());
+
+            // The debugger's caches have now been initialized
+            dbg.caches_initialized = true;
         }
 
         // Reset the debugger for use
@@ -571,9 +725,11 @@ impl Debugger {
             memory_snapshot_delta,
             memory_reads,
             memory_writes,
+            rips,
             byte_history,
             ready_vec_instr_index,
             ready_vec_bytes,
+            caches_initialized,
         } = self;
 
         let mut total = 0;
@@ -598,7 +754,11 @@ impl Debugger {
         serialize!(memory_snapshot_delta);
         serialize!(memory_reads);
         serialize!(memory_writes);
+        serialize!(rips);
         serialize!(byte_history);
+        serialize!(ready_vec_instr_index);
+        serialize!(ready_vec_bytes);
+        serialize!(caches_initialized);
 
         results.sort();
 
@@ -699,10 +859,14 @@ impl Debugger {
         }
     }
 
+    /// Get the value of the given register at the current index. Returns the current value
+    /// and whether this register was written at the given index.
+    pub fn get_register(&self, reg: Register) -> (u64, bool) {
+        self.get_register_at(reg, self.index)
+    }
+
     pub fn context_at(&mut self, index: InstrIndex) {
         timeloop::scoped_timer!(Timer::ContextAt);
-
-        println!("index: {index}");
 
         macro_rules! get_reg_with_color {
             ($reg:ident) => {{
@@ -832,31 +996,116 @@ impl Debugger {
         timeloop::scoped_timer!(Timer::UpdateMemory);
 
         if target_index >= self.index {
+            // Update forward
             timeloop::scoped_timer!(Timer::UpdateMemoryForward);
-            // Update forward (easy path)
-            for (i, diffs) in self.memory_diffs[self.index as usize..target_index as usize + 1]
+
+            // Collapse all of the memory writes for this difference
+            let mut memory_writes = BTreeMap::new();
+            let start = std::time::Instant::now();
+
+            // Collapse all of the memory and register writes for the forward pass
+            for (index, diffs) in self.memory_diffs[self.index as usize..target_index as usize + 1]
                 .iter()
                 .enumerate()
             {
+                let instr_index = index as InstrIndex;
+                let rip = self.register_values[Register::Rip as usize][instr_index as usize];
+
+                // Add this instruction to the known executed instructions
+                self.rips
+                    .entry(rip)
+                    .or_insert_with(|| self.ready_vec_instr_index.pop().unwrap_or_default())
+                    .push(instr_index);
+
                 for MemoryDataItem {
                     address,
                     bytes,
                     access,
+                    num_bytes,
                 } in diffs.iter()
                 {
-                    self.memory.set_bytes(
-                        self.index + i as InstrIndex,
-                        address,
-                        bytes,
-                        access,
-                        &mut self.memory_reads,
-                        &mut self.memory_writes,
-                        &mut self.byte_history,
-                        &mut self.ready_vec_bytes,
-                        &mut self.ready_vec_instr_index,
-                    );
+                    // If the debugger hasn't been initialized, cache all of the
+                    // memory read and write locations for each instruction
+                    if !self.caches_initialized {
+                        // Set the requested bytes to the memory
+                        for index in 0..num_bytes as usize {
+                            let byte = bytes[index];
+                            let curr_addr = address + index as u64;
+
+                            // Mark this byte in the history for this instruction index
+                            let (indexes, bytes) =
+                                self.byte_history.entry(curr_addr).or_insert_with(|| {
+                                    (
+                                        self.ready_vec_instr_index.pop().unwrap_or_default(),
+                                        self.ready_vec_bytes.pop().unwrap_or_default(),
+                                    )
+                                });
+
+                            if *indexes.last().unwrap_or(&0) <= instr_index {
+                                indexes.push(instr_index);
+                                bytes.push(byte);
+
+                                if matches!(access, MemoryAccess::Read) {
+                                    self.memory_reads
+                                        .entry(curr_addr)
+                                        .or_insert_with(|| {
+                                            self.ready_vec_instr_index.pop().unwrap_or_default()
+                                        })
+                                        .push(instr_index);
+                                } else if matches!(access, MemoryAccess::Write) {
+                                    self.memory_writes
+                                        .entry(curr_addr)
+                                        .or_insert_with(|| {
+                                            self.ready_vec_instr_index.pop().unwrap_or_default()
+                                        })
+                                        .push(instr_index);
+                                }
+                            }
+                        }
+                    }
+
+                    for (i, byte) in bytes.iter().enumerate() {
+                        memory_writes.insert(address + i as u64, *byte);
+                    }
                 }
             }
+
+            log::info!(
+                "{:?} Done.. Entries {}",
+                start.elapsed(),
+                memory_writes.len()
+            );
+            let start = std::time::Instant::now();
+
+            let mut memory_writes = memory_writes.iter().collect::<Vec<_>>();
+            memory_writes.sort();
+            let mut byte_index = 0;
+            let mut temp_buf = [0_u8; 64];
+            let mut prev_addr = 0;
+            for (addr, byte) in memory_writes {
+                if addr.saturating_sub(1) != prev_addr || byte_index >= temp_buf.len() {
+                    // Found a non-consecutive address or the temp buffer is full, write the current buffer
+                    let write_addr = prev_addr - byte_index as u64 + 1;
+                    log::debug!(
+                        "Writing out: {write_addr:#x} {:x?}",
+                        &temp_buf[..byte_index]
+                    );
+
+                    // Write out these consecutive bytes
+                    self.memory.write_bytes(write_addr, &temp_buf[..byte_index]);
+
+                    // Reset the temp bufs and index
+                    temp_buf = [0_u8; 64];
+                    byte_index = 0;
+                }
+
+                // Add the current entry to the temp buffer
+                log::debug!("Addr: {addr:#x} Byte: {byte:#x}");
+                temp_buf[byte_index] = *byte;
+                byte_index += 1;
+                prev_addr = *addr;
+            }
+            log::info!("{:?} Done2..", start.elapsed());
         } else {
             timeloop::scoped_timer!(Timer::UpdateMemoryBackward);
 
@@ -877,12 +1126,13 @@ impl Debugger {
                         address,
                         bytes,
                         access,
+                        num_bytes,
                     } in diffs.iter()
                     {
                         if matches!(access, MemoryAccess::Write)
                             || matches!(access, MemoryAccess::Read)
                         {
-                            for offset in 0..bytes.len() as u64 {
+                            for offset in 0..num_bytes as u64 {
                                 writes.insert(address + offset, i as InstrIndex + target_index);
                             }
                         }
@@ -913,15 +1163,15 @@ impl Debugger {
                 match result {
                     Err(0) => {
                         // If there was no prior byte in this address's history.
-                        self.memory
-                            .set_byte_state(*addr, memory::ByteState::Unknown);
+                        // self.memory.set_byte_state(*addr, memory::ByteState::Unknown);
+                        self.memory.set_byte(*addr, 0);
                     }
                     Err(index) => {
                         // Get the last known byte before this address was written
                         let last_byte = bytes[index - 1];
                         log::debug!("  --> {last_write} ({last_byte:#x})");
 
-                        self.memory.set_byte_state(*addr, memory::ByteState::Known);
+                        // self.memory.set_byte_state(*addr, memory::ByteState::Known);
                         self.memory.set_byte(*addr, last_byte);
                     }
                     Ok(mut index) => {
@@ -943,8 +1193,7 @@ impl Debugger {
                         // is unknown
                         if target_index < addresses[index] {
                             // log::debug!("  --> UNSET {:#x}", *addr);
-                            self.memory
-                                .set_byte_state(*addr, memory::ByteState::Unknown);
+                            //self.memory.set_byte_state(*addr, memory::ByteState::Unknown);
                             // let bytes = self.memory.read(*addr, 4);
                             // log::debug!("  --> {:#x} UNSET {:x?}", *addr, bytes);
                         } else {
@@ -952,7 +1201,7 @@ impl Debugger {
                             let last_byte = bytes[index];
                             log::debug!("  --> 123 {last_write} ({last_byte:#x})");
 
-                            self.memory.set_byte_state(*addr, memory::ByteState::Known);
+                            // self.memory.set_byte_state(*addr, memory::ByteState::Known);
                             self.memory.set_byte(*addr, last_byte);
                         }
                     }
@@ -962,7 +1211,7 @@ impl Debugger {
     }
 
     /// Get the instruction indexes of the reads of the given address
-    pub fn get_address_reads(&self, address: u64) -> Vec<InstrIndex> {
+    pub fn get_memory_reads(&self, address: u64) -> Vec<InstrIndex> {
         timeloop::scoped_timer!(Timer::GetAddressReads);
 
         self.memory_reads
@@ -972,7 +1221,7 @@ impl Debugger {
     }
 
     /// Get the instruction indexes of the writes of the given address
-    pub fn get_address_writes(&self, address: u64) -> Vec<InstrIndex> {
+    pub fn get_memory_writes(&self, address: u64) -> Vec<InstrIndex> {
         timeloop::scoped_timer!(Timer::GetAddressWrites);
 
         self.memory_writes
@@ -988,13 +1237,13 @@ impl Debugger {
         let mut result = BTreeSet::new();
 
         // Add the reads
-        let reads = self.get_address_reads(address);
+        let reads = self.get_memory_reads(address);
         for read in reads {
             result.insert(read);
         }
 
         // Add the writes
-        let writes = self.get_address_writes(address);
+        let writes = self.get_memory_writes(address);
         for write in writes {
             result.insert(write);
         }
@@ -1003,6 +1252,34 @@ impl Debugger {
         let mut result = result.iter().cloned().collect::<Vec<_>>();
         result.sort();
         result
+    }
+
+    /// Go to the previous read of the given address
+    pub fn goto_prev_read(&mut self, address: u64) {
+        let reads = self.get_memory_reads(address);
+        log::info!("reads: {reads:?}");
+
+        if reads.is_empty() {
+            log::warn!("No memory reads from {address:#x}");
+            return;
+        }
+
+        let result = reads.binary_search(&self.index);
+
+        // Get the previous index
+        let next_index = match result {
+            Ok(index) => index,
+            Err(0) => {
+                log::warn!("No previous memory reads from {address:#x}");
+                return;
+            }
+            Err(index) => index - 1,
+        };
+
+        log::info!("{} -> {}", self.index, next_index);
+
+        // Goto the found index
+        self.goto_index(next_index as InstrIndex);
     }
 }
 
@@ -1039,17 +1316,16 @@ impl<const REGISTER_ENTRIES: usize> TraceDiff<REGISTER_ENTRIES> {
         &mut self,
         address: u64,
         num_bytes: u8,
-        new_bytes: [u8; 8],
+        new_bytes: [u8; 16],
         access: MemoryAccess,
     ) -> Result<(), Error> {
         timeloop::scoped_timer!(Timer::AddMemory);
-
-        self.memory_data.addresses.push(address);
-        self.memory_data
-            .bytes
-            .push(new_bytes[..num_bytes as usize].to_vec());
-        self.memory_data.accesses.push(access);
-
+        self.memory_data.add(
+            address,
+            new_bytes[..num_bytes.into()].to_vec(),
+            access,
+            num_bytes,
+        );
         Ok(())
     }
 

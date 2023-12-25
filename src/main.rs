@@ -17,6 +17,9 @@ fn main() -> Result<(), timeturner::Error> {
     let start = std::time::Instant::now();
     let mut dbg = Debugger::from_file(&args.filename)?;
     println!("Reading file took: {:?}", start.elapsed());
+    dbg.print_stats();
+
+    return Ok(());
 
     /*
     for _ in 0..1 {
@@ -28,11 +31,25 @@ fn main() -> Result<(), timeturner::Error> {
     dbg.print_stats();
     */
 
-    for i in [0, 1, 2, 3, 2, 1, 0] {
-        dbg.goto_index(i);
-        dbg.hexdump(0xcff70, 0x20);
-        dbg.print_context();
+    let mut percentages = [0; 10];
+    for i in 1..10 {
+        percentages[i] = dbg.entries / (i as u32 * 10);
     }
+
+    for i in [0, 9, 5, 1, 8, 0, 7] {
+        let i = percentages[i];
+        let start = std::time::Instant::now();
+        dbg.goto_index(i);
+        println!(
+            "Command took: {:?} ({:.2?} FPS)",
+            start.elapsed(),
+            1.0 / start.elapsed().as_secs_f64()
+        );
+        // dbg.print_context();
+    }
+
+    dbg.print_stats();
+    println!("DELTA: {}", dbg.memory_snapshot_delta);
 
     Ok(())
 }
